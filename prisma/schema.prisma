@@ -1,0 +1,16 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-py"
+}
+
+model DeauthPacket {
+  id               Int      @id @default(autoincrement())
+  timestamp        DateTime @default(now())
+  source_mac       String
+  destination_mac  String
+  count            Int
+}
