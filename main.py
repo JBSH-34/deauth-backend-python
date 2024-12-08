@@ -9,15 +9,18 @@ import asyncio
 from pydantic import BaseModel
 from icecream import ic  # IceCream 임포트
 
+
 class DeauthRateResponse(BaseModel):
     timestamp: str
     deauth_rate: float
     deauth_packets: int
     total_packets: int
 
+
 class DeauthHistoryResponse(BaseModel):
     timestamp: str
     count: int
+
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
@@ -31,11 +34,13 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
     await shutdown_event()
     ic("Exiting lifespan context manager")
 
+
 app = FastAPI(lifespan=lifespan)
 db: Prisma = Prisma()
 
 # List of connected WebSocket clients
 clients: List[WebSocket] = []
+
 
 async def startup_event() -> None:
     """
@@ -45,9 +50,10 @@ async def startup_event() -> None:
     ic("Starting up: Connecting to the database")
     await db.connect()
     ic("Database connected")
-    ic("Starting background task: sniff_deauth_packets")
-    asyncio.create_task(sniff_deauth_packets())
-    ic("Background task started")
+    ic("Starting background task: sniff_deauth_packets in a separate thread")
+    asyncio.create_task(asyncio.to_thread(sniff_deauth_packets))
+    ic("Background task started in a separate thread")
+
 
 async def shutdown_event() -> None:
     """
@@ -57,6 +63,7 @@ async def shutdown_event() -> None:
     ic("Shutting down: Disconnecting from the database")
     await db.disconnect()
     ic("Database disconnected")
+
 
 @app.websocket("/stream/deauth-rate")
 async def stream_deauth_rate(websocket: WebSocket) -> None:
@@ -80,6 +87,7 @@ async def stream_deauth_rate(websocket: WebSocket) -> None:
     except WebSocketDisconnect:
         clients.remove(websocket)
         ic("WebSocket disconnected and removed from clients list")
+
 
 @app.get("/detection/deauth-rate", response_model=DeauthRateResponse)
 async def get_deauth_rate() -> DeauthRateResponse:
@@ -113,6 +121,7 @@ async def get_deauth_rate() -> DeauthRateResponse:
         total_packets=total_packets
     )
 
+
 @app.get("/statistics/deauth-rate/history", response_model=List[DeauthHistoryResponse])
 async def get_deauth_rate_history(
         limit: int = Query(10, description="Number of recent records to retrieve")
@@ -137,9 +146,10 @@ async def get_deauth_rate_history(
     ic(f"Formatted history: {history}")
     return history
 
-async def sniff_deauth_packets() -> None:
+
+def sniff_deauth_packets() -> None:
     """
-    Background task that continuously sniffs for deauth packets using Scapy.
+    Blocking function that continuously sniffs for deauth packets using Scapy.
     Whenever a deauth packet is detected, it triggers the `save_deauth_packet` function.
     """
     ic("Starting packet sniffing on interface wlx88366cf5c04d")
@@ -159,7 +169,9 @@ async def sniff_deauth_packets() -> None:
                 source_mac: str = packet.addr2
                 destination_mac: str = packet.addr1
                 ic(f"Deauth packet detected from {source_mac} to {destination_mac}")
-                asyncio.create_task(save_deauth_packet(source_mac, destination_mac))
+                asyncio.run_coroutine_threadsafe(
+                    save_deauth_packet(source_mac, destination_mac), asyncio.get_event_loop()
+                )
             else:
                 ic("Non-deauth packet detected")
         else:
@@ -171,6 +183,7 @@ async def sniff_deauth_packets() -> None:
         ic("Sniffing completed")
     except Exception as e:
         ic("Error during sniffing", e)
+
 
 async def save_deauth_packet(source_mac: str, destination_mac: str) -> None:
     """
