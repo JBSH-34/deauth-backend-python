@@ -7,10 +7,11 @@ generator client {
   provider = "prisma-client-py"
 }
 
-model DeauthPacket {
+model Packet {
   id               Int      @id @default(autoincrement())
-  timestamp        DateTime @default(now())
   source_mac       String
   destination_mac  String
   count            Int
+  timestamp        DateTime @default(now())
+  is_deauth        Boolean
 }

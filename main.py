@@ -50,8 +50,11 @@ async def startup_event() -> None:
     ic("Starting up: Connecting to the database")
     await db.connect()
     ic("Database connected")
-    ic("Starting background task: sniff_deauth_packets in a separate thread")
-    asyncio.create_task(asyncio.to_thread(sniff_deauth_packets))
+    ic("Starting background task: sniff_packets in a separate thread")
+
+    # 현재 이벤트 루프를 가져와서 sniff_packets에 전달
+    loop = asyncio.get_running_loop()
+    asyncio.create_task(asyncio.to_thread(sniff_packets, loop))
     ic("Background task started in a separate thread")
 
 
@@ -99,7 +102,7 @@ async def get_deauth_rate() -> DeauthRateResponse:
               and the total packet count.
     """
     ic("Fetching deauth rate from the database")
-    total_packets: int = await db.deauthpacket.count()
+    total_packets: int = await db.packet.count()
     ic(f"Total packets: {total_packets}")
     if total_packets == 0:
         ic("No packets found")
@@ -110,7 +113,7 @@ async def get_deauth_rate() -> DeauthRateResponse:
             total_packets=0
         )
 
-    deauth_packets: int = await db.deauthpacket.count(where={"count": {"gte": 1}})
+    deauth_packets: int = await db.packet.count(where={"is_deauth": True})
     ic(f"Deauth packets: {deauth_packets}")
     deauth_rate: float = deauth_packets / total_packets
     ic(f"Deauth rate calculated: {deauth_rate}")
@@ -137,7 +140,12 @@ async def get_deauth_rate_history(
         List[DeauthHistoryResponse]: A list of dictionaries, each containing a timestamp and deauth packet count.
     """
     ic(f"Fetching deauth rate history with limit={limit}")
-    records = await db.deauthpacket.find_many(order={"timestamp": "desc"}, take=limit)
+    # 이력 데이터는 is_deauth=True인 패킷에 대해만 가져온다고 가정
+    records = await db.packet.find_many(
+        where={"is_deauth": True},
+        order={"timestamp": "desc"},
+        take=limit
+    )
     ic(f"Records fetched: {records}")
     history = [
         DeauthHistoryResponse(timestamp=r.timestamp.isoformat(), count=r.count)
@@ -147,35 +155,33 @@ async def get_deauth_rate_history(
     return history
 
 
-def sniff_deauth_packets() -> None:
+def sniff_packets(loop: asyncio.AbstractEventLoop) -> None:
     """
-    Blocking function that continuously sniffs for deauth packets using Scapy.
-    Whenever a deauth packet is detected, it triggers the `save_deauth_packet` function.
+    Blocking function that continuously sniffs packets using Scapy.
+    For each packet captured, save it to the database (deauth or not).
     """
-    ic("Starting packet sniffing on interface wlx88366cf5c04d")
 
     def packet_handler(packet: Any) -> None:
-        """
-        Callback function for handling captured packets.
-        Checks if the packet is a deauth packet and, if so, saves it to the database.
-
-        Parameters:
-            packet (Any): The captured network packet.
-        """
         ic("Packet captured", packet.summary())
         if packet.haslayer(Dot11):
-            # Check if the packet is a deauth frame (type 0, subtype 12)
-            if packet.type == 0 and packet.subtype == 12:
-                source_mac: str = packet.addr2
-                destination_mac: str = packet.addr1
-                ic(f"Deauth packet detected from {source_mac} to {destination_mac}")
-                asyncio.run_coroutine_threadsafe(
-                    save_deauth_packet(source_mac, destination_mac), asyncio.get_event_loop()
-                )
-            else:
-                ic("Non-deauth packet detected")
+            dot11_layer = packet.getlayer(Dot11)
+            ic(f"Dot11 Layer - Type: {dot11_layer.type}, Subtype: {dot11_layer.subtype}")
+            # Deauth 패킷 판별 로직
+            is_deauth = (dot11_layer.type == 0 and dot11_layer.subtype == 12)
+            source_mac: str = dot11_layer.addr2 or "Unknown"
+            destination_mac: str = dot11_layer.addr1 or "Unknown"
+            # 올바른 이벤트 루프 전달
+            asyncio.run_coroutine_threadsafe(
+                save_packet(source_mac, destination_mac, is_deauth),
+                loop
+            )
         else:
-            ic("Packet does not have Dot11 layer")
+            # Dot11 레이어가 없을 경우에도 패킷 정보를 저장할 수 있음
+            # 단, 여기서는 addr 필드 접근이 불가하므로 Unknown 처리
+            asyncio.run_coroutine_threadsafe(
+                save_packet("Unknown", "Unknown", False),
+                loop
+            )
 
     try:
         # Start sniffing on the specified interface in monitor mode with the packet_handler callback
@@ -185,40 +191,34 @@ def sniff_deauth_packets() -> None:
         ic("Error during sniffing", e)
 
 
-async def save_deauth_packet(source_mac: str, destination_mac: str) -> None:
+async def save_packet(source_mac: str, destination_mac: str, is_deauth: bool) -> None:
     """
-    Saves or updates a deauth packet record in the database.
-    If a record from the same source and destination MAC already exists, increments the count.
-    Otherwise, creates a new record.
-
-    Parameters:
-        source_mac (str): The MAC address of the deauth packet sender.
-        destination_mac (str): The MAC address of the deauth packet receiver.
+    Saves or updates a packet record in the database.
+    If a record with the same source and destination MAC exists, increment the count.
+    Otherwise, create a new record.
     """
-    ic(f"Saving deauth packet from {source_mac} to {destination_mac}")
+    ic(f"Saving packet from {source_mac} to {destination_mac}, is_deauth={is_deauth}")
     try:
-        # Check if a record already exists for the given source and destination MAC
-        record = await db.deauthpacket.find_first(
-            where={"source_mac": source_mac, "destination_mac": destination_mac}
+        record = await db.packet.find_first(
+            where={"source_mac": source_mac, "destination_mac": destination_mac, "is_deauth": is_deauth}
         )
         ic("Record fetched from database", record)
         if record:
-            # Update the existing record by incrementing the count
-            await db.deauthpacket.update(
+            await db.packet.update(
                 where={"id": record.id},
                 data={"count": record.count + 1}
             )
             ic(f"Updated record ID {record.id} with new count {record.count + 1}")
         else:
-            # Insert a new record if no matching record exists
-            await db.deauthpacket.create(
+            await db.packet.create(
                 data={
                     "source_mac": source_mac,
                     "destination_mac": destination_mac,
                     "count": 1,
-                    "timestamp": datetime.now()
+                    "timestamp": datetime.now(),
+                    "is_deauth": is_deauth
                 }
             )
             ic(f"Created new record for {source_mac} to {destination_mac}")
     except Exception as e:
-        ic("Error saving deauth packet", e)
+        ic("Error saving packet", e)
